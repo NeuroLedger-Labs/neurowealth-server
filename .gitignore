@@ -1,0 +1,15 @@
+node_modules
+.env
+.env.*
+!.env.example
+dist
+logs/
+postgres/
+coverage/
+
+.agents/
+skills-lock.json
+CLAUDE.md
+plan.md
+tasks/
+fix.md

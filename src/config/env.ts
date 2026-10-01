@@ -1,0 +1,837 @@
+import dotenv from 'dotenv'
+import { logger } from '../utils/logger'
+dotenv.config()
+
+function requireEnv(key: string): string {
+  const value = process.env[key]
+  if (!value) throw new Error(`Missing required environment variable: ${key}`)
+  return value
+}
+
+/**
+ * Default RPC URLs for each Stellar network.
+ * Used when STELLAR_RPC_URL is not explicitly set.
+ */
+const STELLAR_RPC_URLS: Record<string, string> = {
+  testnet: 'https://soroban-testnet.stellar.org',
+  mainnet: 'https://soroban-mainnet.stellar.org',
+  futurenet: 'https://soroban-futurenet.stellar.org',
+}
+
+/**
+ * Explorer URLs for each Stellar network.
+ */
+export const STELLAR_EXPLORER_URLS: Record<string, string> = {
+  testnet: 'https://stellar.expert/explorer/testnet',
+  mainnet: 'https://stellar.expert/explorer/public',
+  futurenet: 'https://stellar.expert/explorer/futurenet',
+}
+
+/**
+ * Derive the Stellar RPC URL from the network configuration.
+ * Priority: STELLAR_RPC_URL env var > network default.
+ */
+function deriveRpcUrl(network: string): string {
+  const envUrl = process.env.STELLAR_RPC_URL
+  if (envUrl) return envUrl
+
+  const defaultUrl = STELLAR_RPC_URLS[network]
+  if (!defaultUrl) {
+    throw new Error(
+      `No default RPC URL for network "${network}". Set STELLAR_RPC_URL.`
+    )
+  }
+
+  return defaultUrl
+}
+
+/**
+ * Validate all required environment variables at startup.
+ * Collects ALL missing/invalid vars before throwing so the operator
+ * sees every problem in a single startup failure — not one at a time.
+ */
+function validateAllRequiredEnvVars(): void {
+  const requiredVars = [
+    'STELLAR_NETWORK',
+    'STELLAR_AGENT_SECRET_KEY',
+    'VAULT_CONTRACT_ID',
+    'USDC_TOKEN_ADDRESS',
+    'ANTHROPIC_API_KEY',
+    'DATABASE_URL',
+    'JWT_SEED',
+    'WALLET_ENCRYPTION_KEY',
+    'TWILIO_AUTH_TOKEN',
+    'NODE_ENV',
+  ]
+
+  const errors: string[] = []
+
+  // ── 1. Missing vars ──────────────────────────────────────────────────────
+  for (const key of requiredVars) {
+    if (!process.env[key]) {
+      errors.push(`Missing required environment variable: ${key}`)
+    }
+  }
+
+  // ── 2. WALLET_ENCRYPTION_KEY: must be exactly 64 lowercase hex chars ────
+  //       (represents 32 bytes, suitable for AES-256)
+  const walletKey = process.env.WALLET_ENCRYPTION_KEY
+  if (walletKey && !/^[0-9a-f]{64}$/i.test(walletKey)) {
+    errors.push(
+      `WALLET_ENCRYPTION_KEY is invalid: must be exactly 64 hexadecimal characters (32 bytes). ` +
+        `Got length ${walletKey.length}. Generate one with: openssl rand -hex 32`
+    )
+  }
+
+  // ── 3. JWT_SEED: must be at least 32 characters for cryptographic strength ─
+  const jwtSeed = process.env.JWT_SEED
+  if (jwtSeed && jwtSeed.length < 32) {
+    errors.push(
+      `JWT_SEED is too weak: must be at least 32 characters. ` +
+        `Got length ${jwtSeed.length}. Use a strong random string or generate with: openssl rand -base64 48`
+    )
+  }
+
+  // ── 4. ANTHROPIC_API_KEY: must start with sk-ant- prefix ─────────────────
+  const anthropicKey = process.env.ANTHROPIC_API_KEY
+  if (anthropicKey && !anthropicKey.startsWith('sk-ant-')) {
+    errors.push(
+      `ANTHROPIC_API_KEY is invalid: must start with "sk-ant-". ` +
+        `Got prefix "${anthropicKey.substring(0, 7)}". Get your key from: https://console.anthropic.com/`
+    )
+  }
+
+  // ── 5. TWILIO_AUTH_TOKEN: must be at least 32 characters ───────────────────
+  const twilioToken = process.env.TWILIO_AUTH_TOKEN
+  if (twilioToken && twilioToken.length < 32) {
+    errors.push(
+      `TWILIO_AUTH_TOKEN is too short: must be at least 32 characters. ` +
+        `Got length ${twilioToken.length}. Get your token from: https://console.twilio.com/`
+    )
+  }
+
+  // ── 6. DATABASE_URL: must be valid postgres:// connection string ────────
+  const databaseUrl = process.env.DATABASE_URL
+  if (
+    databaseUrl &&
+    !databaseUrl.startsWith('postgresql://') &&
+    !databaseUrl.startsWith('postgres://')
+  ) {
+    errors.push(
+      `DATABASE_URL is invalid: must start with "postgresql://" or "postgres://". ` +
+        `Got: "${databaseUrl.substring(0, 20)}...". Example: postgresql://user:pass@localhost:5432/dbname`
+    )
+  }
+
+  // ── 7. STELLAR_RPC_URL: must be valid HTTPS URL ───────────────────────────
+  const stellarRpcUrl = process.env.STELLAR_RPC_URL
+  if (stellarRpcUrl && !stellarRpcUrl.startsWith('https://')) {
+    errors.push(
+      `STELLAR_RPC_URL is invalid: must be a valid HTTPS URL. ` +
+        `Got: "${stellarRpcUrl}". Example: https://soroban-testnet.stellar.org`
+    )
+  }
+
+  // ── 8. VAULT_CONTRACT_ID: must start with C (Stellar contract ID format) ──
+  const vaultContractId = process.env.VAULT_CONTRACT_ID
+  if (vaultContractId && !vaultContractId.startsWith('C')) {
+    errors.push(
+      `VAULT_CONTRACT_ID is invalid: must start with "C" (Stellar contract ID format). ` +
+        `Got: "${vaultContractId}". Example: CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`
+    )
+  }
+
+  // ── 9. USDC_TOKEN_ADDRESS: must start with C (Stellar asset contract) ─────
+  const usdcTokenAddress = process.env.USDC_TOKEN_ADDRESS
+  if (usdcTokenAddress && !usdcTokenAddress.startsWith('C')) {
+    errors.push(
+      `USDC_TOKEN_ADDRESS is invalid: must start with "C" (Stellar contract ID format). ` +
+        `Got: "${usdcTokenAddress}". Example: CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`
+    )
+  }
+
+  // ── 10. NODE_ENV: must be one of the known deployment environments ────────
+  const nodeEnv = process.env.NODE_ENV
+  const validNodeEnvs = [
+    'development',
+    'staging',
+    'production',
+    'test',
+  ] as const
+  if (nodeEnv && !validNodeEnvs.includes(nodeEnv as any)) {
+    errors.push(
+      `NODE_ENV is invalid: "${nodeEnv}". Must be one of: ${validNodeEnvs.join(' | ')}`
+    )
+  }
+
+  if (errors.length > 0) {
+    const list = errors.map((e) => `  - ${e}`).join('\n')
+    throw new Error(
+      `Application cannot start — environment configuration errors:\n${list}\n\n` +
+        `Fix the variables above and restart the application.\n\n` +
+        `Reference: See .env.example for required variables and their formats.`
+    )
+  }
+}
+
+/**
+ * Validate Stellar network to prevent testnet/mainnet mix-ups.
+ * Protects against accidental mainnet transactions with testnet keys.
+ */
+function validateStellarNetwork(
+  network: string
+): 'testnet' | 'mainnet' | 'futurenet' {
+  const validNetworks = ['testnet', 'mainnet', 'futurenet'] as const
+  const lowerNetwork = network.toLowerCase()
+
+  if (!validNetworks.includes(lowerNetwork as any)) {
+    throw new Error(
+      `Invalid STELLAR_NETWORK: "${network}". Must be one of: ${validNetworks.join(', ')}`
+    )
+  }
+
+  return lowerNetwork as 'testnet' | 'mainnet' | 'futurenet'
+}
+
+/**
+ * Derive the Stellar network from the secret key prefix.
+ * Stellar keys encode the network in the prefix:
+ *   - S... = testnet
+ *   - S... = mainnet (same prefix, but the actual network is determined by passphrase)
+ *
+ * Since key prefixes don't distinguish testnet/mainnet, we use the account
+ * to derive a hint and validate against the configured network.
+ */
+function deriveNetworkFromKeypair(secretKey: string, network: string): string {
+  // All Stellar secret keys start with 'S', so we can't derive the network
+  // from the prefix alone. Instead, we validate key format and rely on
+  // the configured network. The validation here is format-based.
+  return network
+}
+
+/**
+ * Validate that the secret key matches the expected network.
+ * While Stellar keys don't encode network in the prefix, we can:
+ * 1. Validate key format (must start with 'S', 56 chars)
+ * 2. Warn on mainnet usage in non-production environments
+ * 3. Log the active network prominently
+ */
+function validateKeypairNetworkMatch(
+  secretKey: string,
+  network: 'testnet' | 'mainnet' | 'futurenet'
+): void {
+  if (!secretKey.startsWith('S')) {
+    throw new Error(
+      'STELLAR_AGENT_SECRET_KEY must start with S (invalid Stellar secret key format)'
+    )
+  }
+
+  if (secretKey.length !== 56) {
+    throw new Error(
+      `STELLAR_AGENT_SECRET_KEY invalid length: ${secretKey.length}. Stellar keys must be 56 characters.`
+    )
+  }
+
+  const env = process.env.NODE_ENV || 'development'
+  logger.info(
+    `✓ Stellar Agent configured for ${network.toUpperCase()} (NODE_ENV=${env})`
+  )
+
+  if (network === 'mainnet' && env !== 'production') {
+    console.warn(
+      '\n⚠️  CRITICAL WARNING: Using MAINNET in non-production environment!\n' +
+        '⚠️  This could result in real financial loss!\n' +
+        '⚠️  Verify STELLAR_NETWORK and NODE_ENV settings immediately!\n'
+    )
+  }
+}
+
+function parseByteLimit(value: string | undefined, fallback: string): string {
+  return value && /^\d+(kb|mb|b)?$/i.test(value) ? value : fallback
+}
+
+/**
+ * Parse `TRUST_PROXY` for Express `app.set('trust proxy', …)`.
+ *
+ * Supported values:
+ *   (unset)              → 1  (single reverse-proxy hop — Nginx, ALB, Heroku, etc.)
+ *   false | 0            → do not trust X-Forwarded-* headers
+ *   true                 → trust all hops (not recommended in production)
+ *   <number>             → trust that many proxy hops
+ *   loopback             → trust loopback addresses
+ *   loopback,linklocal   → comma-separated Express trust-proxy keywords or IPs
+ */
+function parseTrustProxy(
+  value: string | undefined
+): boolean | number | string | string[] {
+  if (!value?.trim()) return 1
+
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === 'false' || trimmed === '0') return false
+  if (trimmed === 'true') return true
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10)
+  if (value.includes(',')) {
+    return value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  }
+
+  return value.trim()
+}
+
+// ── Run all validations before anything else is exported ──────────────────
+validateAllRequiredEnvVars()
+
+const stellarNetwork = validateStellarNetwork(requireEnv('STELLAR_NETWORK'))
+const agentSecretKey = requireEnv('STELLAR_AGENT_SECRET_KEY')
+validateKeypairNetworkMatch(agentSecretKey, stellarNetwork)
+const stellarRpcUrl = deriveRpcUrl(stellarNetwork)
+
+// Log the active network prominently at startup
+logger.info(`🌐 Active Stellar network: ${stellarNetwork.toUpperCase()}`)
+logger.info(`   RPC URL: ${stellarRpcUrl}`)
+logger.info(`   Explorer: ${STELLAR_EXPLORER_URLS[stellarNetwork]}`)
+
+const bodySizeLimit = parseByteLimit(
+  process.env.BODY_SIZE_LIMIT ?? process.env.BODY_LIMIT_JSON,
+  '64kb'
+)
+
+// ── Typed NODE_ENV ─────────────────────────────────────────────────────────
+type NodeEnv = 'development' | 'staging' | 'production' | 'test'
+const nodeEnv = process.env.NODE_ENV as NodeEnv
+
+const marketVolatilityCircuitBreaker = {
+  enabled: process.env.MARKET_VOLATILITY_BREAKER_ENABLED !== 'false',
+  thresholdPct: Number(
+    process.env.MARKET_VOLATILITY_BREAKER_THRESHOLD_PCT ?? '75'
+  ),
+}
+
+if (
+  !Number.isFinite(marketVolatilityCircuitBreaker.thresholdPct) ||
+  marketVolatilityCircuitBreaker.thresholdPct <= 0
+) {
+  throw new Error(
+    'MARKET_VOLATILITY_BREAKER_THRESHOLD_PCT must be a finite number greater than 0'
+  )
+}
+
+export const config = {
+  port: parseInt(process.env.PORT || '3001'),
+  nodeEnv,
+  stellar: {
+    network: stellarNetwork,
+    rpcUrl: stellarRpcUrl,
+    agentSecretKey,
+    vaultContractId: requireEnv('VAULT_CONTRACT_ID'),
+    usdcTokenAddress: requireEnv('USDC_TOKEN_ADDRESS'),
+  },
+  ai: {
+    anthropicApiKey: requireEnv('ANTHROPIC_API_KEY'),
+    brianApiKey: process.env.BRIAN_API_KEY || '',
+  },
+  database: {
+    url: requireEnv('DATABASE_URL'),
+    /**
+     * Max connections Prisma may open per instance. Applied to the connection
+     * string as `connection_limit` (see src/db/index.ts). Keep this in line with
+     * the Postgres `max_connections` budget divided across all replicas.
+     */
+    connectionLimit: parseInt(process.env.DATABASE_CONNECTION_LIMIT || '10'),
+    /** How often (ms) to poll prisma.$metrics.json() for pool gauges. */
+    poolMetricsIntervalMs: parseInt(
+      process.env.DB_POOL_METRICS_INTERVAL_MS || '15000'
+    ),
+  },
+  requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '30000'),
+  jwt: {
+    /**
+     * JWT_SEED: 64-hex secret used to sign/verify JWTs.
+     * Rotate every 90 days. Inject via AWS Secrets Manager, HashiCorp Vault,
+     * or GitHub Actions secrets — never commit the raw value.
+     */
+    seed: requireEnv('JWT_SEED'),
+    session_ttl_hours: parseInt(process.env.JWT_SESSION_TTL_HOURS || '24'),
+    nonce_ttl_ms: parseInt(process.env.JWT_NONCE_TTL_MS || '300000'),
+    interval_ms: parseInt(process.env.JWT_CLEANUP_INTERVAL_MS || '86400000'),
+  },
+  security: {
+    /**
+     * WALLET_ENCRYPTION_KEY: 32-byte hex key for encrypting stored wallet secrets.
+     * Rotate with a coordinated key migration. Inject via AWS Secrets Manager or
+     * HashiCorp Vault — never commit the raw value.
+     */
+    walletEncryptionKey: process.env.WALLET_ENCRYPTION_KEY || '',
+    /**
+     * CORS origin allowlist is deliberately NOT parsed here. It is owned by
+     * `src/config/cors.ts` (#471), which normalises origins, handles subdomain
+     * wildcards, and decides environment strictness. Two parsers for one setting
+     * is how the previous implementation ended up enforcing a variable the env
+     * files never set.
+     */
+    bodySizeLimit,
+    bodyLimits: {
+      json: parseByteLimit(process.env.BODY_LIMIT_JSON, bodySizeLimit),
+      urlencoded: parseByteLimit(
+        process.env.BODY_LIMIT_URLENCODED,
+        bodySizeLimit
+      ),
+    },
+    /** Global rate limiter — applied to every route */
+    rateLimit: {
+      windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000'),
+      max: parseInt(process.env.RATE_LIMIT_MAX || '100'),
+    },
+    /** Auth endpoints — stricter to resist credential stuffing */
+    authRateLimit: {
+      windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS || '900000'),
+      max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '20'),
+    },
+    /** Admin endpoints — tightest limits (management/sensitive ops) */
+    adminRateLimit: {
+      windowMs: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '900000'),
+      max: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10'),
+    },
+    /** Internal/agent endpoints — higher throughput for service-to-service calls */
+    internalRateLimit: {
+      windowMs: parseInt(process.env.INTERNAL_RATE_LIMIT_WINDOW_MS || '60000'),
+      max: parseInt(process.env.INTERNAL_RATE_LIMIT_MAX || '500'),
+    },
+    /**
+     * Anonymous traffic (#473) — unauthenticated callers to the public API.
+     * Deliberately far stricter than the authenticated tier: an anonymous
+     * request has no proven identity, so the budget exists to slow enumeration
+     * and scraping rather than to accommodate legitimate use. The split only
+     * works if it is enforced on *both* sides — if the authenticated tier were
+     * as tight, every user behind one corporate NAT would exhaust the shared
+     * per-IP budget, and the limiter would push load onto the login endpoint.
+     */
+    anonymousRateLimit: {
+      windowMs: parseInt(
+        process.env.ANONYMOUS_RATE_LIMIT_WINDOW_MS || '900000'
+      ),
+      max: parseInt(process.env.ANONYMOUS_RATE_LIMIT_MAX || '60'),
+    },
+    /**
+     * Authenticated traffic (#473) — keyed per principal (see principalKey in
+     * src/middleware/rateLimiter.ts), so this is a per-user or per-API-key
+     * allowance rather than a per-IP one.
+     */
+    authenticatedRateLimit: {
+      windowMs: parseInt(
+        process.env.AUTHENTICATED_RATE_LIMIT_WINDOW_MS || '900000'
+      ),
+      max: parseInt(process.env.AUTHENTICATED_RATE_LIMIT_MAX || '600'),
+    },
+    /**
+     * Sensitive operations (#473) — money movement, credential changes and
+     * anything else where one request has irreversible consequences. Applied
+     * per-endpoint on top of the caller's normal budget, not instead of it:
+     * a tight limit here should throttle the risky action, not the reads the
+     * user does around it.
+     */
+    sensitiveRateLimit: {
+      windowMs: parseInt(
+        process.env.SENSITIVE_RATE_LIMIT_WINDOW_MS || '900000'
+      ),
+      max: parseInt(process.env.SENSITIVE_RATE_LIMIT_MAX || '10'),
+    },
+    /**
+     * Portfolio optimizer (#322) — the only genuinely CPU-bound endpoint in the
+     * API. Tighter than the global limiter and applied per-endpoint rather than
+     * via the apiRoutes table, which would throttle read-only portfolio traffic
+     * too. Pairs with the in-flight semaphore in src/utils/concurrency.ts: this
+     * bounds requests per window, that bounds how many run at once.
+     */
+    optimizerRateLimit: {
+      windowMs: parseInt(process.env.OPTIMIZER_RATE_LIMIT_WINDOW_MS || '60000'),
+      max: parseInt(process.env.OPTIMIZER_RATE_LIMIT_MAX || '5'),
+    },
+    /**
+     * Strategy simulate (#344) — a CPU-bound historical replay, like the
+     * optimizer. Tighter than the global limiter so the replay cannot be used
+     * as a CPU-exhaustion vector; pairs with the short-TTL result cache so
+     * identical preview requests are served without recomputing.
+     */
+    simulateRateLimit: {
+      windowMs: parseInt(process.env.SIMULATE_RATE_LIMIT_WINDOW_MS || '60000'),
+      max: parseInt(process.env.SIMULATE_RATE_LIMIT_MAX || '6'),
+    },
+    /** Public webhook endpoints — resist spoofed / replay floods (e.g. Twilio) */
+    webhookRateLimit: {
+      windowMs: parseInt(process.env.WEBHOOK_RATE_LIMIT_WINDOW_MS || '60000'),
+      max: parseInt(process.env.WEBHOOK_RATE_LIMIT_MAX || '30'),
+    },
+    /**
+     * Express `trust proxy` setting — required for correct `req.ip` behind
+     * Nginx, Cloudflare, AWS ALB, Heroku, Kubernetes ingress, etc.
+     * See `parseTrustProxy` for accepted `TRUST_PROXY` values.
+     */
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+    /**
+     * TRUSTED_IPS: comma-separated list of IPv4/IPv6 addresses that bypass rate
+     * limiting entirely (e.g. your CI runner, internal health-check probe).
+     * INTERNAL_SERVICE_TOKEN: bearer token accepted in X-Internal-Token header
+     * for service-to-service calls that should skip per-route limits.
+     */
+    trustedIps: (process.env.TRUSTED_IPS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    internalServiceToken: process.env.INTERNAL_SERVICE_TOKEN || '',
+  },
+  whatsapp: {
+    twilioSid: process.env.TWILIO_ACCOUNT_SID || '',
+    twilioToken: process.env.TWILIO_AUTH_TOKEN || '',
+    fromNumber: process.env.WHATSAPP_FROM || '',
+  },
+  transcription: {
+    provider: process.env.TRANSCRIPTION_PROVIDER || 'openai',
+    /**
+     * Secondary provider used when the primary is unavailable (#400). The
+     * registry wraps both into a single provider that retries the fallback
+     * only on a TranscriptionUnavailableError — not on UnsupportedAudioError,
+     * where a second vendor would fail identically.
+     */
+    fallbackProvider: process.env.TRANSCRIPTION_FALLBACK_PROVIDER || 'deepgram',
+    openaiApiKey: process.env.OPENAI_API_KEY || '',
+    deepgramApiKey: process.env.DEEPGRAM_API_KEY || '',
+    model: process.env.TRANSCRIPTION_MODEL || 'whisper-1',
+    deepgramModel: process.env.DEEPGRAM_MODEL || 'nova-2',
+    apiUrl:
+      process.env.TRANSCRIPTION_API_URL ||
+      'https://api.openai.com/v1/audio/transcriptions',
+    deepgramApiUrl:
+      process.env.DEEPGRAM_API_URL || 'https://api.deepgram.com/v1/listen',
+    confidenceThreshold: parseFloat(
+      process.env.TRANSCRIPTION_CONFIDENCE_THRESHOLD || '0.6'
+    ),
+  },
+  dlq: {
+    alertThreshold: parseInt(process.env.DLQ_ALERT_THRESHOLD || '50'),
+    alertCooldownMs: parseInt(process.env.DLQ_ALERT_COOLDOWN_MS || '900000'),
+  },
+  httpClient: {
+    timeoutMs: parseInt(process.env.HTTP_CLIENT_TIMEOUT_MS || '10000'),
+    maxRetries: parseInt(process.env.HTTP_CLIENT_MAX_RETRIES || '3'),
+    baseDelayMs: parseInt(process.env.HTTP_CLIENT_BASE_DELAY_MS || '200'),
+    maxDelayMs: parseInt(process.env.HTTP_CLIENT_MAX_DELAY_MS || '10000'),
+    circuitBreakerThreshold: parseInt(
+      process.env.HTTP_CLIENT_CIRCUIT_BREAKER_THRESHOLD || '5'
+    ),
+    circuitBreakerResetMs: parseInt(
+      process.env.HTTP_CLIENT_CIRCUIT_BREAKER_RESET_MS || '30000'
+    ),
+  },
+  shutdown: {
+    drainTimeoutMs: parseInt(process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || '30000'),
+  },
+  /**
+   * Authenticated real-time WebSocket stream (#316) — see
+   * docs/WEBSOCKET_STREAMING.md for the client contract these bounds imply.
+   */
+  websocket: {
+    /** Mount path of the upgrade endpoint. */
+    path: process.env.WS_PATH || '/api/v1/ws',
+    /** Ping cadence. A peer that misses two consecutive pongs is closed. */
+    heartbeatIntervalMs: parseInt(
+      process.env.WS_HEARTBEAT_INTERVAL_MS || '30000'
+    ),
+    /** How long a socket may stay silent (no pong, no frame) before closing. */
+    idleTimeoutMs: parseInt(process.env.WS_IDLE_TIMEOUT_MS || '90000'),
+    /**
+     * Per-connection outbound buffer bound. Past this the connection is marked
+     * gapped and events are dropped with a resumable marker rather than queued
+     * — a slow consumer must cost its own liveness, never the pod's memory.
+     */
+    maxBufferedEvents: parseInt(process.env.WS_MAX_BUFFERED_EVENTS || '256'),
+    /** Socket-level backpressure bound (bytes still unflushed by the kernel). */
+    maxBufferedBytes: parseInt(
+      process.env.WS_MAX_BUFFERED_BYTES || String(1024 * 1024)
+    ),
+    /** Simultaneous connections one authenticated user may hold on one pod. */
+    maxConnectionsPerUser: parseInt(
+      process.env.WS_MAX_CONNECTIONS_PER_USER || '5'
+    ),
+    /** Handshake flood guard, per source IP. A connection flood is a DoS. */
+    handshakeRateLimit: {
+      windowMs: parseInt(process.env.WS_HANDSHAKE_WINDOW_MS || '60000'),
+      max: parseInt(process.env.WS_HANDSHAKE_MAX || '30'),
+    },
+    /** Client→server message rate. Exceeding it closes the socket. */
+    messageRateLimit: {
+      windowMs: parseInt(process.env.WS_MESSAGE_WINDOW_MS || '10000'),
+      max: parseInt(process.env.WS_MESSAGE_MAX || '50'),
+    },
+    /** Largest client frame accepted. Client messages are tiny control frames. */
+    maxMessageBytes: parseInt(process.env.WS_MAX_MESSAGE_BYTES || '4096'),
+    /** Events one `resume` may replay before the client must resume again. */
+    replayMaxEvents: parseInt(process.env.WS_REPLAY_MAX_EVENTS || '1000'),
+    /**
+     * How often a live connection re-verifies its session against the database,
+     * so a logout or a deactivated account kills the socket rather than waiting
+     * for it to disconnect on its own.
+     */
+    sessionRecheckMs: parseInt(process.env.WS_SESSION_RECHECK_MS || '60000'),
+    /** Coalescing window for clients that opt in at subscribe time. */
+    coalesceWindowMs: parseInt(process.env.WS_COALESCE_WINDOW_MS || '250'),
+    /** How long a draining client should wait before reconnecting. */
+    drainRetryAfterMs: parseInt(process.env.WS_DRAIN_RETRY_AFTER_MS || '2000'),
+  },
+  retention: {
+    processedEventsDays: parseInt(
+      process.env.RETENTION_PROCESSED_EVENTS_DAYS || '90'
+    ),
+    deadLetterEventsDays: parseInt(
+      process.env.RETENTION_DEAD_LETTER_EVENTS_DAYS || '30'
+    ),
+    agentLogsDays: parseInt(process.env.RETENTION_AGENT_LOGS_DAYS || '60'),
+    /**
+     * Real-time stream retention (#316). Short by design: this table exists to
+     * close a reconnect gap, not to be a second event log — ProcessedEvent and
+     * Transaction remain the durable record. A client offline longer than this
+     * gets a `gap` frame and re-fetches a REST snapshot.
+     */
+    userEventsDays: parseInt(process.env.RETENTION_USER_EVENTS_DAYS || '7'),
+    /**
+     * Per-user row cap, enforced alongside the age sweep. Age alone lets one
+     * pathological account grow without bound inside the window.
+     */
+    userEventsMaxPerUser: parseInt(
+      process.env.USER_EVENT_STREAM_MAX_PER_USER || '5000'
+    ),
+    intervalMs: parseInt(process.env.RETENTION_INTERVAL_MS || '86400000'),
+  },
+  protocolRisk: {
+    intervalMs: parseInt(process.env.PROTOCOL_RISK_INTERVAL_MS || '21600000'),
+    // #529 — when true, a ProtocolRiskMetadataEntry past nextReviewDueAt is
+    // auto-downgraded to dataConfidence: UNVERIFIED. Default off (flag-only):
+    // stale entries are surfaced but not silently altered.
+    staleAutoDowngrade:
+      process.env.PROTOCOL_RISK_STALE_AUTO_DOWNGRADE === 'true',
+  },
+  portfolioRisk: {
+    intervalMs: parseInt(process.env.PORTFOLIO_RISK_INTERVAL_MS || '21600000'),
+  },
+  marketVolatilityCircuitBreaker,
+  alertRules: {
+    intervalMs: parseInt(process.env.ALERT_RULES_INTERVAL_MS || '60000'),
+  },
+  strategyMarketplace: {
+    metricsIntervalMs: parseInt(
+      process.env.STRATEGY_METRICS_INTERVAL_MS || '21600000'
+    ),
+    riskFreeRate: parseFloat(process.env.STRATEGY_RISK_FREE_RATE || '0'),
+  },
+  attribution: {
+    intervalMs: parseInt(process.env.ATTRIBUTION_INTERVAL_MS || '21600000'),
+    benchmarkProtocols: (process.env.ATTRIBUTION_BENCHMARK_PROTOCOLS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  },
+  allocationSuggestions: {
+    intervalMs: parseInt(
+      process.env.ALLOCATION_SUGGESTION_INTERVAL_MS || '21600000'
+    ),
+    maxConcurrent: parseInt(
+      process.env.ALLOCATION_SUGGESTION_MAX_CONCURRENT || '2'
+    ),
+    batchSize: parseInt(process.env.ALLOCATION_SUGGESTION_BATCH_SIZE || '25'),
+  },
+  referral: {
+    minActivationDeposit: parseFloat(
+      process.env.REFERRAL_MIN_ACTIVATION_DEPOSIT || '10'
+    ),
+    ownerReward: parseFloat(process.env.REFERRAL_OWNER_REWARD || '5'),
+    referredReward: parseFloat(process.env.REFERRAL_REFERRED_REWARD || '5'),
+    tier2Enabled:
+      (process.env.REFERRAL_TIER2_ENABLED || 'false').toLowerCase() === 'true',
+    tier2Reward: parseFloat(process.env.REFERRAL_TIER2_REWARD || '1'),
+    rewardAsset: process.env.REFERRAL_REWARD_ASSET || 'USDC',
+    rewardContractMethod:
+      process.env.REFERRAL_REWARD_CONTRACT_METHOD || 'transfer_reward',
+    payoutIntervalMs: parseInt(
+      process.env.REFERRAL_PAYOUT_INTERVAL_MS || '120000'
+    ),
+  },
+  recurringDeposits: {
+    intervalMs: parseInt(
+      process.env.RECURRING_DEPOSITS_INTERVAL_MS || '300000'
+    ),
+  },
+  /**
+   * Tool-calling assistant (#318) — replaces the rule-based parser
+   * (src/nlp/parser.ts) as the recognition layer for open-ended requests, with
+   * the parser retained as fallback. See src/agent/assistant/.
+   */
+  assistant: {
+    /**
+     * Off by default. WhatsApp/Telegram only route the 'unknown' bucket
+     * (open-ended requests the rule-based parser can't classify) into the
+     * assistant when this is true — every recognized command keeps going
+     * through the existing parser path unconditionally. REST
+     * /api/v1/assistant/chat always uses the assistant regardless of this
+     * flag (it has no rule-based fallback to gate).
+     */
+    enabled:
+      (process.env.ASSISTANT_ENABLED || 'false').toLowerCase() === 'true',
+    model: process.env.ASSISTANT_MODEL || 'claude-sonnet-4-5',
+    maxTokens: parseInt(process.env.ASSISTANT_MAX_TOKENS || '1024'),
+    maxToolCallsPerTurn: parseInt(
+      process.env.ASSISTANT_MAX_TOOL_CALLS_PER_TURN || '5'
+    ),
+    /** Per-user token budget and the window it resets over. */
+    perUserTokenBudget: parseInt(
+      process.env.ASSISTANT_PER_USER_TOKEN_BUDGET || '20000'
+    ),
+    perUserBudgetWindowMs: parseInt(
+      process.env.ASSISTANT_PER_USER_BUDGET_WINDOW_MS || String(60 * 60 * 1000)
+    ),
+    /** Global token budget across all users and the window it resets over. */
+    globalTokenBudget: parseInt(
+      process.env.ASSISTANT_GLOBAL_TOKEN_BUDGET || '2000000'
+    ),
+    globalBudgetWindowMs: parseInt(
+      process.env.ASSISTANT_GLOBAL_BUDGET_WINDOW_MS || String(60 * 60 * 1000)
+    ),
+    /**
+     * Fraction of portfolio value above which a withdrawal is treated as
+     * sensitive regardless of model confidence (still always confirmed either
+     * way — this only affects the wording of the confirmation prompt).
+     */
+    largeWithdrawalPortfolioFraction: parseFloat(
+      process.env.ASSISTANT_LARGE_WITHDRAWAL_FRACTION || '0.5'
+    ),
+  },
+  approvals: {
+    expirySweepIntervalMs: parseInt(
+      process.env.APPROVAL_EXPIRY_SWEEP_INTERVAL_MS || '60000'
+    ),
+  },
+  outbox: {
+    dispatchIntervalMs: parseInt(
+      process.env.OUTBOX_DISPATCH_INTERVAL_MS || '15000'
+    ),
+    maxAttempts: parseInt(process.env.OUTBOX_MAX_ATTEMPTS || '5'),
+    backoffBaseMs: parseInt(process.env.OUTBOX_BACKOFF_BASE_MS || '2000'),
+    backoffMaxMs: parseInt(process.env.OUTBOX_BACKOFF_MAX_MS || '120000'),
+    submittedTimeoutMs: parseInt(
+      process.env.OUTBOX_SUBMITTED_TIMEOUT_MS || '90000'
+    ),
+    feeBumpMultiplier: parseFloat(
+      process.env.OUTBOX_FEE_BUMP_MULTIPLIER || '2'
+    ),
+    feeBumpMaxAttempts: parseInt(
+      process.env.OUTBOX_FEE_BUMP_MAX_ATTEMPTS || '3'
+    ),
+    globalMaxInFlight: parseInt(
+      process.env.OUTBOX_GLOBAL_MAX_IN_FLIGHT || '10'
+    ),
+    perAccountMaxInFlight: parseInt(
+      process.env.OUTBOX_PER_ACCOUNT_MAX_IN_FLIGHT || '1'
+    ),
+    batchSize: parseInt(process.env.OUTBOX_BATCH_SIZE || '20'),
+    maxAbsFee: parseInt(process.env.OUTBOX_MAX_ABS_FEE || '100000'),
+    lowDeferMs: parseInt(process.env.OUTBOX_LOW_DEFER_MS || '15000'),
+    lowMaxDeferMs: parseInt(process.env.OUTBOX_LOW_MAX_DEFER_MS || '300000'),
+  },
+  /**
+   * Agent circuit breaker (#345) — pre-trade guards that halt agent-initiated
+   * rebalancing at GLOBAL / PROTOCOL / USER scope on abnormal loss, de-peg,
+   * oscillation or stale data. Each rule is independently toggleable and is
+   * evaluated by pure functions in src/agent/breakerRules.ts. The de-peg rule
+   * is disabled by default: it needs a live stablecoin price feed, and the
+   * platform currently has none wired (the fee oracle exposes fees, not
+   * prices), so enabling it without a real feed would never trip — leave off
+   * until an oracle path exists.
+   */
+  breaker: {
+    /** Master switch for the whole circuit breaker. */
+    enabled: (process.env.BREAKER_ENABLED ?? 'true').toLowerCase() === 'true',
+    abnormalLoss: {
+      enabled:
+        (process.env.BREAKER_ABNORMAL_LOSS_ENABLED ?? 'true').toLowerCase() ===
+        'true',
+      /** Portfolio down more than this percentage over the window trips. */
+      lossPct: parseFloat(process.env.BREAKER_LOSS_PCT || '5'),
+      /** Trailing window (hours) over which drawdown is measured. */
+      windowHours: parseInt(process.env.BREAKER_LOSS_WINDOW_HOURS || '24'),
+    },
+    depeg: {
+      enabled:
+        (process.env.BREAKER_DEPEG_ENABLED ?? 'false').toLowerCase() === 'true',
+      /** Stablecoin price deviation from $1 (basis points) that trips. */
+      depegBps: parseInt(process.env.BREAKER_DEPEG_BPS || '150'),
+      /**
+       * Consecutive clean evaluations required before an OPEN de-peg breaker
+       * may transition to HALF_OPEN — a single recovered tick is not enough.
+       */
+      sustainedClearChecks: parseInt(
+        process.env.BREAKER_DEPEG_SUSTAINED_CHECKS || '3'
+      ),
+      /** Where the integration layer looks for the stablecoin spot price. */
+      priceSource: process.env.BREAKER_DEPEG_PRICE_SOURCE || 'fee-oracle',
+    },
+    oscillation: {
+      enabled:
+        (process.env.BREAKER_OSCILLATION_ENABLED ?? 'true').toLowerCase() ===
+        'true',
+      /** Rebalances of the same batch within the window that trip. */
+      maxFlips: parseInt(process.env.BREAKER_MAX_FLIPS || '3'),
+      /** Sliding window (hours) for the flip count. */
+      windowHours: parseInt(process.env.BREAKER_FLIP_WINDOW_HOURS || '24'),
+    },
+    staleData: {
+      enabled:
+        (process.env.BREAKER_STALE_DATA_ENABLED ?? 'true').toLowerCase() ===
+        'true',
+      /** APY table older than this (minutes) must not be traded on. */
+      staleMinutes: parseInt(process.env.BREAKER_STALE_MINUTES || '120'),
+      /** Consecutive scan failures before stale-data trips. */
+      consecutiveFailures: parseInt(
+        process.env.BREAKER_STALE_CONSECUTIVE_FAILURES || '3'
+      ),
+    },
+    /** Base cooldown before an OPEN breaker may auto-transition to HALF_OPEN. */
+    cooldownMs: parseInt(process.env.BREAKER_COOLDOWN_MS || '3600000'),
+    /** Hard cap on cooldown after repeated re-tripping (backoff doubling). */
+    maxCooldownMs: parseInt(process.env.BREAKER_MAX_COOLDOWN_MS || '86400000'),
+  },
+  feeOracle: {
+    pollMs: parseInt(process.env.FEE_ORACLE_POLL_MS || '10000'),
+    ttlMs: parseInt(process.env.FEE_ORACLE_TTL_MS || '30000'),
+    min: parseInt(process.env.FEE_ORACLE_MIN || '100'),
+    max: parseInt(process.env.FEE_ORACLE_MAX || '50000'),
+    defaultBaseFee: parseInt(process.env.FEE_ORACLE_DEFAULT_BASE_FEE || '100'),
+  },
+  sponsor: {
+    minXlmFloor: parseFloat(process.env.SPONSOR_MIN_XLM_FLOOR || '10'),
+  },
+  reserveReconciliation: {
+    intervalMs: parseInt(
+      process.env.RESERVE_RECONCILIATION_INTERVAL_MS || '3600000'
+    ),
+  },
+  apiKeys: {
+    maxActivePerUser: parseInt(process.env.USER_API_KEY_MAX_ACTIVE || '10'),
+    withdrawalsEnabled:
+      (process.env.USER_API_KEY_WITHDRAWALS_ENABLED ?? 'true') === 'true',
+  },
+  sessions: {
+    revokedRetainDays: parseInt(process.env.REVOKED_SESSION_RETAIN_DAYS || '7'),
+  },
+  nlp: {
+    /**
+     * Minimum confidence (0-1) a parsed Intent must carry to be acted on
+     * directly (#401). Below this, the rule-based parser returns a
+     * 'clarification' intent instead of guessing at the nearest pattern or
+     * falling straight through to 'unknown'.
+     */
+    confidenceThreshold: parseFloat(
+      process.env.NLP_CONFIDENCE_THRESHOLD || '0.6'
+    ),
+  },
+}
